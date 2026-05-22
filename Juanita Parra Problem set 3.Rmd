@@ -1,0 +1,716 @@
+---
+title: "Juanita Parra - Problem Set 3"
+date: 11/03/2025
+output: 
+  pdf_document:
+    latex_engine: xelatex
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center", fig.width = 6, fig.height = 4, echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r setup 2, include=TRUE}
+setwd("/Users/juanita/OneDrive/Mac/UIC/Fall2025/Econ475")
+
+# Load packages
+library(haven)    
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(tidyverse)
+library(modelsummary)
+library(sandwich)
+library(lmtest)
+library(broom)
+library(fixest)
+library(estimatr)
+library(car)
+
+# Load the dataset
+cook <- read_dta("cook_stat.dta")
+
+# Check variables (these names might differ, adjust based on your dataset)
+names(cook)
+
+#Drop Na values 
+cook <- cook %>% 
+  filter(!is.na(totpop_r))
+```
+
+
+## 1. Segregation in Cook County
+The following analysis will look at the composition of Cook county between 1980-2010, with the purpose of understanding segregation dynamics in this region. First we look at how white, black and hispanic community sahres are distributed. 
+
+```{r Race variables, include=TRUE}
+#Construction of neighborhood-level percentage of each group at the tract level
+
+cook <- cook %>%
+  mutate(
+    whiteshare = totwht/totpop_r,
+    blackshare = totblk/totpop_r,
+    hispshare = tothisp/totpop_r, 
+    nonwhiteshare = 1 - whiteshare
+  )
+
+cook <- cook %>% 
+  filter(!is.na(blackshare), blackshare >= 0, blackshare <= 1)
+
+
+# Reshape to long format
+cook_long <- cook %>%
+  select(year, blackshare, whiteshare, nonwhiteshare) %>%
+  pivot_longer(
+    cols = c(blackshare, whiteshare, nonwhiteshare),
+    names_to = "group",
+    values_to = "share"
+  )
+```
+
+```{r Group and time distribution, echo=TRUE}
+# How each group's share is distributed overall
+ggplot(cook_long, aes(x = share, colour = group, fill = group)) +
+  geom_density(alpha = 0.25, adjust = 0.6) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_color_manual(values = c("blackshare" = "lightblue",
+                                "whiteshare" = "pink",
+                                "nonwhiteshare" = "violet")) +
+  scale_fill_manual(values = c("blackshare" = "lightblue",
+                               "whiteshare" = "pink",
+                               "nonwhiteshare" = "violet")) +
+  labs(x = "Share (0–1)",
+       y = "Density",
+       title = "Kernel densities of group shares",
+       colour = "Group",
+       fill = "Group") +
+  theme_minimal()
+
+
+#How each group's share varies each year
+ggplot(cook_long, aes(x = share, colour = factor(year), fill = factor(year))) +
+  geom_density(alpha = 0.25, adjust = 2) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(
+    x = "Share (0–1)",
+    y = "Density",
+    title = "Kernel densities of group shares over time",
+    colour = "Year",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  facet_wrap(~ group)
+
+```
+Based on the Kernel density graph looking at group shares, we can see that the data shows segregation patterns. The light blue peak near 0 shows that most areas have a low share of black communities. Whereas the pink line peak shows that in the tracts present in the data, there are mostly white. And the violet line shows hw nonwhite populations are spread across multiple areas, with a high peak near 0 because it also includes the black population. Overall it shows a bimodal distribution of highly segregated regions. However, we can see how this pattern has decrease over time. In the second Kernel density graph, we can see how in 1970 they were almost no black people living in this areas, but it decreased substantially after 1980, due to anti-segregation laws impose in public schools. Nevertheless, we still see a higher density of white communities in this areas up to 2010, but it is more spread out compared to other years. 
+
+```{r Fractions of tracts, include = TRUE}
+# 5. Fractions of tracts each year with >= 80% composition
+frac_80 <- cook %>%
+     group_by(year) %>%
+     summarize(
+         n_tracts = sum(!is.na(totpop_r)),
+         prop_white80 = mean(whiteshare >= 0.8, na.rm = TRUE),
+         prop_black80 = mean(blackshare >= 0.8, na.rm = TRUE),
+         prop_hisp80  = mean(hispshare  >= 0.8, na.rm = TRUE)
+     ) %>%
+     arrange(year) %>%
+     mutate(across(starts_with("prop_"), ~ . * 100)) # convert to percent of tracts
+```
+Then, we will look at the fraction of each racial/ethnic group.
+```{r 80% population, echo=TRUE}
+kable(frac_80,
+      caption = "Fraction of Census Tracts with ≥80% Population from Each Racial/Ethnic Group, Cook County (1980–2010)",
+      col.names = c("Year", "Number of Tracts", "≥80% White", "≥80% Black", "≥80% Hispanic"),
+      digits = 1,
+      align = "c")
+
+```
+
+As presented in table 1, we can see that there was a somewhat level of diversification, but there was still racial concentration as for the black share stayed the same, but for hispanics it has a rapid growth between 1990 and 2000, and for whites, it was a decreased of their presence in this areas. 
+
+Because of this results, we continue with the creation of a Dissimilarity index to measure the degree of segregation in the region.
+
+```{r RDI, include = TRUE}
+# 5. Fractions of tracts each year with >= 80% composition
+rdi_calc <- function(df, groupA_col, groupB_col, year_col = "year") {
+  df %>%
+    group_by(across(all_of(year_col))) %>%
+    summarize(
+      A_total = sum(.data[[groupA_col]], na.rm = TRUE),
+      B_total = sum(.data[[groupB_col]], na.rm = TRUE),
+      RDI = 0.5 * sum(abs((.data[[groupA_col]] / A_total) - (.data[[groupB_col]] / B_total)), na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+rdi_black_white <- rdi_calc(cook, "totblk", "totwht")
+rdi_hisp_white  <- rdi_calc(cook, "tothisp", "totwht")
+rdi_black_hisp  <- rdi_calc(cook, "totblk", "tothisp")
+
+rdi_all <- rdi_black_white %>%
+  rename(RDI_black_white = RDI) %>%
+  left_join(rdi_hisp_white %>% rename(RDI_hisp_white = RDI), by = "year") %>%
+  left_join(rdi_black_hisp %>% rename(RDI_black_hisp = RDI), by = "year")
+
+rdi_table <- rdi_all %>%
+  select(year, RDI_black_white, RDI_hisp_white, RDI_black_hisp)
+```
+
+```{r RDI table, echo=TRUE}
+kable(rdi_table,
+      caption = "Racial Dissimilarity Indices for Cook County, 1970–2010",
+      col.names = c("Year", "Black–White", "Hispanic–White", "Black–Hispanic"),
+      digits = 3,
+      align = "c")
+
+```
+Table 2 reports how Black-White segregation is extremely high across 1970, and although it declines until 2010, it still indicates a very high segregation. With respect of Hispanic-White we see a more moderate segregation that also decrease over time. This difference may be due to the fact that the presence of hispanics groups increased over the years, which may have led to a greater spatial mixing with whites over time. However, between Black a hispanic, we also see a very high index, suggesting that both races may be concentrated in different tracts. Overall, all indices decline over time, but the absolute levels of Black-White and Black-Hispanic still remain high, suggesting that segregation is still present. 
+
+## 2. Looking at the relationship between tract composition and other socioeconomic indicators
+For the following analysis, in order to have accurate estimates, we will focus on people with age 25 and over because they are more likely to have completed some type of education.
+
+```{r Tract and socioeconomic indicators , include = TRUE}
+#Create education share 
+cook <- cook %>% 
+  mutate(
+    share_hs25p = educ12 / numpers25,     
+    share_somecollege25p = educ15 / numpers25,        
+    share_college25p = educ16 / numpers25, 
+    share_nonhs25p = 1 - (share_hs25p + share_somecollege25p + share_college25p)
+     )
+
+cook <- cook %>% 
+  filter(!is.na(blackshare), blackshare >= 0, blackshare <= 1)
+
+#Per-household income variable
+cook <- cook %>%
+  mutate(
+    pc_household_income = ifelse(numhh > 0, agghhinc / numhh, NA)
+  )
+
+# Create summary statistics for the education share variables
+education_summary <- cook %>%
+  summarise(
+    share_hs25p_mean = mean(share_hs25p, na.rm = TRUE),
+    share_hs25p_sd = sd(share_hs25p, na.rm = TRUE),
+    share_somecollege25p_mean = mean(share_somecollege25p, na.rm = TRUE),
+    share_somecollege25p_sd = sd(share_somecollege25p, na.rm = TRUE),
+    share_college25p_mean = mean(share_college25p, na.rm = TRUE),
+    share_college25p_sd = sd(share_college25p, na.rm = TRUE),
+    share_nonhs25p_mean = mean(share_nonhs25p, na.rm = TRUE),
+    share_nonhs25p_sd = sd(share_nonhs25p, na.rm = TRUE)
+  )
+```
+
+```{r Education share table, echo=TRUE}
+# Display table with kable
+kable(education_summary, digits = 3, 
+      col.names = c("HS Share Mean", "HS Share SD", 
+                    "Some College Mean", "Some College SD",
+                    "College Share Mean", "College Share SD",
+                    "Non-HS Share Mean", "Non-HS Share SD"),
+      caption = "Summary Statistics for Education Share Variables (25+) in Cook County")
+
+```
+In general we see that on average 27% of adults have completed high school, white 16.6% have some college experience. Nevertheless, non-high school graduates form the largest share of 34.9% of adults. 
+
+First we sample at random 20% of the tracts for visualisation purposes. 
+```{r Scatter plots for white share, echo=TRUE}
+#Scatter plots for group share and per capita household income 
+
+#Sample at random 20% of the tracts for visualisation purposes
+set.seed(123)  # for reproducibility
+cook_sample <- cook %>% sample_frac(0.2)
+
+#White share
+ggplot(cook_sample, aes(x = whiteshare, y = pc_household_income, color = factor(year))) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  scale_y_continuous(labels = scales::dollar_format(), limits = c(0, 100000)) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    x = "White Share (0–1)",
+    y = "Per-Household Income",
+    color = "Year",
+    title = "Racial Composition and Income over Time in Cook County"
+  ) +
+  theme_minimal(base_size = 14)
+```
+Based on this graph we can see that the county's per-household income for white groups has grown over the years. However, we see that some tracts have very low incomes, while others are much higher. We also see that the slope for 1990 and 2010 are steeper, suggesting that income increases were higher in already wealthier tracts. Finally, the graph suggest some upward mobility as there is more dispersion around 2010 between low and high income tracts. 
+
+```{r Scatter plots for Black share, echo=TRUE}
+#Black share 
+ggplot(cook_sample, aes(x = blackshare, y = pc_household_income, color = factor(year))) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  scale_y_continuous(labels = scales::dollar_format(), limits = c(0, 100000)) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Blackshare (0–1)",
+    y = "Per-Household Income",
+    color = "Year",
+    title = "Racial Composition and Income over Time in Cook County"
+  ) +
+  theme_minimal(base_size = 14)
+```
+For black communities, the story is different. We see that even though the per household income increase for this group over the years, as the share of black residents in tracts increases, the average per household income follows a decreasing trend. In this case, we do not see a spread of incomes, as most of the concentration is in the lower part, suggesting persistent inequality between neighborhoods. However, we see a flatter slope in 2010, suggesting than income differences between tracts with low and high blackshare are smaller demostrating a small reduction in income inequality across neighborhoods, but still presenting a negative relation. This may be due to other factors like gentrification or sorting. Another interesting fact to noticed is that in tracts were there is not a majority of black population, the per household income on average did not present a big change from 2000-2010. This may be due to historical segregation or economic growth inequality across the county.
+
+
+```{r Scatter plots for hispanic share, echo=TRUE}
+#Hispanic share
+ggplot(cook_sample, aes(x = hispshare, y = pc_household_income, color = factor(year))) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  scale_y_continuous(labels = scales::dollar_format(), limits = c(0, 100000)) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Hispanic share (0–1)",
+    y = "Per-Household Income",
+    color = "Year",
+    title = "Racial Composition and Income over Time in Cook County"
+  ) +
+  theme_minimal(base_size = 14)
+```
+Finally, for hispanic groups, we see that there are very few tracts with majority Hispanic shares. Nevertheless, it shows that as hispanic share increases, the per-household income decreases, specially over the years. Overall, we see that race/ethnicity share is correlated with per-household income. For Black and hispanic communities this relationship is negative, with some changes like income distribution over time. Whereas, for white communities, we see a positive relationship. 
+
+Now we  explore the relationship between  tract-level racial/ethnic composition and the variables income, education, and unemployement, poverty and welfare. We used the whiteshare as the reference share to avoid collinearity. 
+
+
+```{r Set variables, include = TRUE}
+
+# create transformed LHS for income (use asinh if zeros)
+cook$log_pc_inc <- log(cook$pc_household_income)
+
+# Define control strings
+controls_income <- "tractpop + numhh + forborn + s_forborn + share_college25p + share_hs25p + hsdrop"
+controls_edu    <- "tractpop + numhh + forborn + s_forborn + hsdrop"
+controls_labpov <- "tractpop + numhh + forborn + s_forborn + share_college25p + share_hs25p"
+```
+
+```{r Regression on log income, echo=TRUE}
+#Income
+reg1 <- feols(log_pc_inc ~ blackshare + hispshare + 
+              tractpop + numhh + forborn + s_forborn + share_college25p + share_hs25p + hsdrop,
+              data = cook)
+
+# Get robust standard errors
+reg1_tidy <- broom::tidy(reg1, se = "hetero")
+
+# Create a table with kable
+kable(reg1_tidy, 
+      digits = 3, 
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of Log Per-Household Income on Racial Composition and Socioeconomic Controls")
+
+
+```
+
+For analyzing income, we used as controls education, populations, and dropout rates. This analysis shows that as the proportion of Back residents increases by 1, the log per household income increases by approximately 50%. This suggest that the downward trend that we saw before may have been related to this control factor at a greater extend than the blackshare itself. We see the same trend with hispanic share with a 125% increase in income. This is explained by the increase in log income of 3.3 points when an extra unit of college educated adults share, and by the 2.2 coefficient for highschool educated adults. This aligns also with the reduction of per-household income when high scholl rates increase. This shows that more than racial/ethic shares, the difference of log incomes of this communities are explained by factors like education rather than the share itself. For this reason, we will analyze the relation between racial/ethnic composition with education. 
+
+```{r Regression on Education, echo=TRUE}
+#Education for college
+reg2 <- feols(share_college25p ~ blackshare + hispshare + 
+              tractpop + numhh + forborn + s_forborn + hsdrop,
+              data = cook)
+
+reg2_tidy <- broom::tidy(reg2, se = "hetero")
+kable(reg2_tidy, digits = 3,
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of College Education Share on Racial Composition and Socioeconomic Controls")
+
+#High school education
+# 3a) High school graduates (HS or more)
+reg3_hs <- feols(share_hs25p ~ blackshare + hispshare + 
+                 tractpop + numhh + forborn + s_forborn + hsdrop,
+                 data = cook)
+
+reg3_hs_tidy <- broom::tidy(reg3_hs, se = "hetero")
+kable(reg3_hs_tidy, digits = 3,
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of High School Education Share on Racial Composition and Socioeconomic Controls")
+
+
+# 3b) No high school diploma
+reg3_nonhs <- feols(share_nonhs25p ~ blackshare + hispshare + 
+                    tractpop + numhh + forborn + s_forborn + hsdrop,
+                    data = cook)
+
+reg3_nonhs_tidy <- broom::tidy(reg3_nonhs, se = "hetero")
+kable(reg3_nonhs_tidy, digits = 3,
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of Non-High School Education Share on Racial Composition and Socioeconomic Controls")
+```
+Since we saw that college and high school share are strong predictors of per-household income, we now see that tracts with higher shares of Black or Hispanic populations tend to have lower proportions of college educated adults, after controlling for population, foreign-born shares, household count and high school dropout rates. High school completition also shows a negative and highly significant coefficient, suggesting that higher black and hispanic share is associated with lower high school attainment. Similarly, we see that higher minority shares tend to have a larger proportion of adults without a high school diploma. Overall, this results highlight persistent educational disparities that correlate with racial/ethnic composition. 
+
+```{r Regression on Unemployement, echo=TRUE}
+#Unemployement
+reg4 <- feols(unemrt ~ blackshare + hispshare + share_college25p + share_hs25p + 
+              tractpop + numhh + forborn + s_forborn,
+              data = cook)
+
+reg4_tidy <- broom::tidy(reg4, se = "hetero")
+kable(reg4_tidy, digits = 3,
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of Unemployment Rate on Racial Composition and Socioeconomic Controls")
+```
+Moreover, we see that higher shares of Black and Hispanic groups experience higher unemployement. Specially as one unit increase in Blackshare is associated with a 0.15 increase in unemployement and for Hispanics is a 0.077 increase holding other factors constant. We also see that higher rates of college education are associated with lower unemployement, whereas for high scholl graduates the impact is not as significant, suggesting the importance of going to college. This results highligh persistent racial diisparities in the labor market outcomes. 
+
+```{r Regression on Poverty and welfare, echo=TRUE}
+#Poverty
+reg5  <- feols(pov ~ blackshare + hispshare + share_college25p + share_hs25p +
+                   tractpop + numhh + forborn + s_forborn,
+                   data = cook)
+
+reg5_tidy <- broom::tidy(reg5, se = "hetero")
+kable(reg5_tidy, digits = 3,
+      col.names = c("Term", "Estimate", "Std. Error", "Statistic", "p-value"),
+      caption = "Regression of Poverty Rate on Racial Composition and Socioeconomic Controls")
+
+```
+Finally we see that tracts with higher shares of Black and Hispanic residents experience significantly higher poverty. Specifically, a one-unit increase in Blackshare is associated with an increase of approximately 883 individuals in poverty, while a one-unit increase in Hispshare corresponds to an increase of about 491 individuals, holding other factors constant. We still see that education is associated with a reduction of approximately 862 individuals in poverty and higher shares of high school reduce the number of individuals facing poverty by about 1,718. This results highlight the importance of educational attainment in mitigating poverty situations and what is interesting is the higher impact high schools have over college graduates. 
+
+## 3. Relationship between school quality and housing prices in 2023
+
+```{r Clean up , include=TRUE}
+schools <- read_dta("/Users/juanita/OneDrive/Mac/UIC/Fall2025/Econ475/cook_schools_sat_2023.dta")
+
+# Clean & format variables
+schools <- schools %>%
+  mutate(
+    percent_lowinc = as.numeric(percent_lowinc),
+    percent_white  = as.numeric(percent_white),
+    percent_black  = as.numeric(percent_black),
+    percent_hisp   = as.numeric(percent_hisp),
+    percent_asian  = as.numeric(percent_asian),
+    sat_math       = as.numeric(satmathaveragescore),
+    sat_read       = as.numeric(satreadingaveragescore),
+    ) %>%
+  mutate(
+    city_flag = if_else(!is.na(city) & str_to_lower(city) == "chicago", "Chicago",
+                        if_else(!is.na(city), "Suburb", NA_character_)
+  ))
+
+```
+
+```{r Fraction of typical HS is low income, echo=TRUE}
+
+
+# Summary statistics of % low-income students across Cook County high schools 
+summary_lowinc <- schools %>%
+  summarise(
+    n_total = n(),
+    mean = mean(percent_lowinc, na.rm = TRUE),
+    sd = sd(percent_lowinc, na.rm = TRUE),
+    median = median(percent_lowinc, na.rm = TRUE),
+    p25 = quantile(percent_lowinc, 0.25, na.rm = TRUE),
+    p75 = quantile(percent_lowinc, 0.75, na.rm = TRUE),
+    frac_over_50 = mean(percent_lowinc > 50, na.rm = TRUE)
+  )
+
+summary_lowinc %>%
+  kable(
+    caption = "Summary Statistics of % Low-Income Students Across Cook County High Schools",
+    digits = 2,
+    booktabs = TRUE
+  )
+
+# Percent low-income by City vs Suburb 
+lowinc_by_area <- schools %>%
+  group_by(city_flag) %>%
+  summarise(
+    n = n(),
+    mean = mean(percent_lowinc, na.rm = TRUE),
+    sd = sd(percent_lowinc, na.rm = TRUE),
+    median = median(percent_lowinc, na.rm = TRUE),
+    frac_over_50 = mean(percent_lowinc > 50, na.rm = TRUE)
+  )
+
+lowinc_by_area %>%
+  kable(
+    caption = "Percent Low-Income Students by City vs Suburb",
+    digits = 2,
+    booktabs = TRUE
+  )
+
+
+```
+Looking at the percent of low income students across Cook county high schools we see that on average, about 65% of students are low income, but this varies across schools. When we break it down by location we see that Chicago schools on average have 80% low income students, with over 90% of schools having more than half of low income students. Whereas suburban schools have an average of 41%.  
+
+Now we proceed to see the relationship between low income and race/ethnicity
+
+```{r Relation low income and race, include=TRUE}
+# We'll run 3 models predicting percent_lowinc:
+# Model A: percent_lowinc ~ percent_black + percent_hisp + percent_white + percent_asian  (race shares)
+# Model B: add sat participation if available or average class size / disabled / dropouts (controls)
+# Model C: full multivariate including extra school characteristics
+
+# Build formula pieces safely (only include variables that have non-NA values)
+race_vars <- c("percent_black", "percent_hisp", "percent_white", "percent_asian")
+race_present <- race_vars[race_vars %in% names(schools)]
+
+controls <- c()
+if ("avg_class_size" %in% names(schools)) controls <- c(controls, "avg_class_size")
+if ("percent_disabled" %in% names(schools)) controls <- c(controls, "percent_disabled")
+if ("dropout_male" %in% names(schools)) controls <- c(controls, "dropout_male")
+if ("dropout_female" %in% names(schools)) controls <- c(controls, "dropout_female")
+
+# Formulas
+form_A <- as.formula(paste("percent_lowinc ~", paste(race_present, collapse = " + ")))
+form_B <- as.formula(paste("percent_lowinc ~", paste(c(race_present, controls), collapse = " + ")))
+
+# Fit models with robust SEs using estimatr::lm_robust for better default
+models_list <- list()
+if (length(race_present) > 0) {
+  models_list$race_only <- lm_robust(form_A, data = schools, se_type = "HC2")
+  models_list$race_plus_controls <- lm_robust(form_B, data = schools, se_type = "HC2")
+} else {
+  message("No race share variables found. Skipping race regressions.")
+}
+
+# If user wants baseline percent_lowinc ~ single race shares or demographic predictors, include fallback:
+models_list$baseline <- lm_robust(percent_lowinc ~ 1, data = schools, se_type = "HC2")
+
+# Present regression table(s) using broom to tidy
+reg_tables <- map(models_list, broom::tidy)
+
+# Combine into one table with model names
+reg_combined <- bind_rows(
+  reg_tables %>% imap(~ mutate(.x, model = .y)),
+  .id = NULL
+) %>%
+  select(model, term, estimate, std.error, statistic, p.value) %>%
+  mutate(across(c(estimate, std.error, statistic, p.value), ~round(., 4)))
+
+cat("\n(2) Regressions: percent_lowinc on race and controls\n")
+reg_combined %>% kable(caption = "Regression results: percent_lowinc (HC2 robust SEs)") %>% print()
+
+```
+This results show that schools with more Black, Hispanic, or Asian students tend to have higher percentages of low-income students. In the model that only looks at race, the share of Black and Hispanic students has a significant positive effect, meaning that as the percentage of these students increases, so does the percentage of low-income students. When we add other school factors like average class size or percent of disabled students, the effects of race are slightly smaller, but Black and Hispanic shares still predict higher low-income rates. The other school characteristics do not seem to matter much. Overall, the results show that racial composition is an important predictor of economic disadvantage in schools, with minority-majority schools having more low-income students. The baseline average confirms this, showing that about 65% of students in the sample are low-income.
+
+So now we want to know how race relate to SAT math and reading average scores.
+
+```{r How those race relate to SAT math and reading, echo=TRUE}
+
+# Prepare long format data
+schools_long <- schools %>%
+  select(satmathaveragescore, satreadingaveragescore, percent_lowinc, all_of(race_present), city_flag) %>%
+  pivot_longer(
+    cols = c(satmathaveragescore, satreadingaveragescore),
+    names_to = "subject",
+    values_to = "score"
+  ) %>%
+  mutate(subject = case_when(
+    subject == "satmathaveragescore" ~ "SAT Math",
+    subject == "satreadingaveragescore" ~ "SAT Reading",
+    TRUE ~ subject
+  ))
+
+# Plot 1: % Low-Income vs SAT scores 
+ggplot(schools_long, aes(x = percent_lowinc, y = score, color = city_flag)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~subject, scales = "free_y") +
+  labs(
+    x = "% Low-Income Students",
+    y = "Average SAT Score",
+    color = "Area",
+    title = "Relationship Between % Low-Income and SAT Scores (Chicago vs Suburbs)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+This graphs shows that schools with a higher percentage of low-income students tend to have lower SAT scores, for both Math and Reading. Also, higher shares of low-income students are associated with lower average SAT Math and Reading scores. When stratifying by location, both Chicago and suburban schools follow the same negative trend, but the relationship is steeper in Chicago, suggesting that socio-economic disparities have a stronger impact on SAT performance in city schools compared to suburban schools.
+
+Next, we will look at specific suburban areas, being: Melrose Park, Maywood, Oak Park, Elmwood Park, LaGrange, Cicero and the city of Chicago,
+```{r Six suburban HS, echo=TRUE}
+submarkets <- c("Melrose Park", "Maywood", "Oak Park", 
+                "Cicero", "Elmwood Park", 
+                "LaGrange")
+
+schools_filtered <- schools %>%
+  filter(city %in% c(submarkets, "Chicago"))
+         
+means_scores <-schools_filtered %>%
+  group_by(city) %>%
+  summarise(
+    mean_math = mean(satmathaveragescore, na.rm = TRUE),
+    mean_reading = mean(satreadingaveragescore, na.rm = TRUE),
+    n_schools = n()
+  ) %>%
+  arrange(city)
+
+kable(
+  means_scores,
+  caption = " Average SAT Math and Reading Scores by Submarket and the City of Chicago",
+  col.names = c("Community", "Mean SAT Math", "Mean SAT Reading", "Number of Schools"),
+  digits = 1,
+  align = "lccc"
+)
+```
+
+On average, Chicago schools have SAT Math and Reading scores of 427 and 443, respectively, based on 90 schools. Scores vary across suburban areas: for example, Cicero has slightly lower scores (Math 418, Reading 428), while Elmwood Park performs higher (Math 460, Reading 470). Maywood shows the lowest Math score (383) but a Reading score of 418, and Oak Park has the highest scores overall (Math 538, Reading 563)
+
+```{r Comparison test scores to prices, echo=TRUE}
+#Clean data
+#Separate joint submarkets 
+
+prices <- read_dta("/Users/juanita/OneDrive/Mac/UIC/Fall2025/Econ475/prices_2022_2023.dta")
+prices_clean <- prices %>%
+  separate_rows(submarket, sep = "/") %>%   
+  mutate(submarket = str_trim(submarket))   
+
+#submarket=city
+prices_clean <- prices_clean %>%
+  rename(city = submarket)
+
+#Fix student enrollment
+schools <- schools %>%
+  mutate(student_enrollment = as.numeric(student_enrollment))
+
+
+# Summarize SAT by city
+
+sat_summary <- schools %>%
+  filter(city %in% c("Melrose Park", "Maywood", "Oak Park", "Cicero", 
+                     "Elmwood Park", "Franklin Park", "LaGrange", "Burbank", "Chicago")) %>%
+  group_by(city) %>%
+  summarise(
+    mean_SATmath = mean(satmathaveragescore, na.rm = TRUE),
+    mean_SATreading = mean(satreadingaveragescore, na.rm = TRUE),
+    numberofschools = n(),
+    total_enrollment = sum(student_enrollment, na.rm = TRUE),
+    pct_lowinc = mean(percent_lowinc, na.rm = TRUE),
+    pct_black = mean(percent_black, na.rm = TRUE),
+    pct_hisp = mean(percent_hisp, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+#Change median price name 
+
+names(prices_clean)[names(prices_clean) == "mediansalesprice2022q32023q2"] <- "median_price"
+
+# Summarize housing prices by city / submarket 
+prices_summary <- prices_clean %>%
+  filter(city %in% sat_summary$city) %>%
+  group_by(city) %>%
+  summarise(
+    median_price = median(median_price, na.rm = TRUE),
+    mean_price = mean(median_price, na.rm = TRUE),
+    n_prices = n()
+  ) %>%
+  ungroup()
+
+
+#  Merge SAT and price summaries
+comm_table <- sat_summary %>%
+  left_join(prices_summary, by = "city") %>%
+  arrange(city)
+
+
+# --- Create log price variable ---
+comm_table <- comm_table %>%
+  mutate(log_median_price = log(median_price))
+```
+
+```{r ggplots for Sat and price, echo=TRUE}
+ggplot(comm_table, aes(x = mean_SATmath, y = log_median_price)) +
+  geom_point(size = 3, alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(
+    x = "Average SAT Math Score",
+    y = "Log Median Housing Price",
+    title = "Log Median Housing Price vs SAT Math"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+ggplot(comm_table, aes(x = mean_SATreading, y = log_median_price)) +
+  geom_point(size = 3, alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(
+    x = "Average SAT reading Score",
+    y = "Log Median Housing Price",
+    title = "Log Median Housing Price vs SAT reading"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+This graphs show that neighborhoods with higher test scores tend to have higher housing prices. Specifically, the relationship is stronger for SAT Math, where the regression line slopes upward more steeply, indicating that each additional point in average Math score is associated with a noticeable increase in housing price. For SAT Reading, the slope is positive but flatter, suggesting a weaker relationship; differences in Reading scores are less strongly linked to housing prices. Overall, these patterns imply that school academic performance, particularly in Math, is an important factor for housing values, but other neighborhood characteristics likely also play a role in determining prices.
+
+Now we see other relationships 
+```{r Other factors, echo=TRUE}
+#  SAT vs School Resources 
+model_resources <- lm_robust(satmathaveragescore ~ avg_class_size,
+                             data = schools, se_type = "HC2")
+
+# Plot: SAT vs Teaching Salary
+ggplot(schools, aes(avg_class_size, satmathaveragescore)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(x = "Average Class Size", y = "Average SAT Score",
+       title = "SAT vs School Resources")
+```
+This graph suggest that a higher average class size is correlated with a higher average SAT score. This may be due to the fact that schools may priorities having a good professor for a big cohort than having more professors that are not as qualified but can teach smaller groups. 
+
+```{r Other factors 2, echo=TRUE}
+#  Attendance & Graduation vs SAT 
+model_attend <- lm_robust(satmathaveragescore ~ hs_grad_rate, data = schools, se_type = "HC2")
+
+
+# Plot: Attendance vs SAT
+ggplot(schools, aes(attend_rate, satmathaveragescore)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkgreen") +
+  labs(x = "Attendance Rate", y = "Average SAT Score",
+       title = "SAT vs Attendance Rate")
+```
+Then we see that as attendance rate increases, the average SAT math scores do to, presenting a positive relationship. 
+
+Finally, we see the relation between English learners and average SAT math scores
+
+```{r Other factors 3, echo=TRUE}
+# Relation between English learners and average SAT math scores
+
+# make sure numeric
+schools <- schools %>%
+     mutate(
+         satmath = as.numeric(satmathaveragescore),
+         percent_el = as.numeric(percent_el),
+         percent_lowinc = as.numeric(percent_lowinc),
+         percent_nonwhite = 100 - as.numeric(percent_white),
+         attend_rate = as.numeric(attend_rate)
+     )
+ 
+# Bivariate with continuous EL share
+m1 <- lm_robust(satmath ~ percent_el, data = schools, se_type = "HC2")
+
+
+# Add controls
+m2 <- lm_robust(satmath ~ percent_el + percent_lowinc + percent_nonwhite + attend_rate, data = schools, se_type = "HC2")
+
+
+m3 <- lm_robust(satmath ~ percent_el * percent_lowinc + percent_nonwhite + attend_rate,data = schools, se_type = "HC2")
+
+# Model 1 table
+tidy(m1) %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  kable(digits = 3, caption = "Model 1: SAT Math ~ Percent EL")
+
+# Model 2 table
+tidy(m2) %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  kable(digits = 3, caption = "Model 2: SAT Math ~ Percent EL + Controls")
+
+# Model 3 table
+tidy(m3) %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  kable(digits = 3, caption = "Model 3: SAT Math ~ Percent EL * Percent Low Income + Controls")
+
+
+```
+This results show that communities with more English Learner (EL) students tend to have lower average SAT Math scores. In the simplest model (Model 1), each additional percent of EL students is linked to a 2.77 points drop in SAT Math. When we add controls for low-income students, nonwhite students, and attendance (Model 2), the effect of EL share is smaller but still significant. In the third model, which looks at how EL share interacts with low-income share, the negative effect of EL share is strongest in communities with fewer low-income students, but the effect weakens as the share of low-income students increases. Overall, higher EL share is associated with lower SAT Math performance, while better attendance supports higher scores.
+
